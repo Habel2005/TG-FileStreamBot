@@ -55,7 +55,11 @@ func getStreamRoute(ctx *gin.Context) {
 				height, err = strconv.Atoi(requested)
 				if err != nil || height <= 0 { http.Error(w, "invalid transcode height", http.StatusBadRequest); return }
 			}
-			sessionID, _, startErr := transcode.Start(worker.Client, file.Location, file.FileSize, height, log)
+
+			// Use one HLS/FFmpeg session per Telegram file + requested height.
+			// PlayerJS may request the original /stream URL more than once.
+			key := fmt.Sprintf("%d:%d:%d", file.ID, file.FileSize, height)
+			sessionID, _, startErr := transcode.StartOrGet(key, worker.Client, file.Location, file.FileSize, height, log)
 			if startErr != nil {
 				log.Error("Failed to start transcoder", zap.Error(startErr))
 				http.Error(w, "failed to start transcoder", http.StatusServiceUnavailable)
@@ -101,7 +105,7 @@ func getStreamRoute(ctx *gin.Context) {
 	if ctx.Query("d") == "true" { disposition = "attachment" }
 	ctx.Header("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, file.FileName))
 
-	if r.Method != "HEAD" {
+	if r.Method != http.MethodHead {
 		pipe, err := stream.NewStreamPipe(ctx, worker.Client, file.Location, start, end, log)
 		if err != nil { log.Error("Failed to create stream pipe", zap.Error(err)); return }
 		defer pipe.Close()
@@ -120,14 +124,24 @@ func getHLSFile(ctx *gin.Context) {
 	if !ok { http.Error(ctx.Writer, "stream session expired", http.StatusNotFound); return }
 
 	var path string
-	for i := 0; i < 100; i++ {
+	// FFmpeg may need time to probe the source and produce the first segment.
+	// Wait up to 45 seconds rather than returning a premature 404.
+	for i := 0; i < 450; i++ {
 		if candidate, exists := transcode.FilePath(session, name); exists { path = candidate; break }
+		if transcode.IsFinished(session) { break }
 		select {
 		case <-ctx.Request.Context().Done(): return
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	if path == "" { http.Error(ctx.Writer, "stream segment not ready", http.StatusNotFound); return }
+	if path == "" {
+		if transcode.IsFinished(session) {
+			http.Error(ctx.Writer, "transcoder stopped before creating requested HLS file", http.StatusServiceUnavailable)
+		} else {
+			http.Error(ctx.Writer, "stream segment not ready", http.StatusGatewayTimeout)
+		}
+		return
+	}
 
 	if strings.HasSuffix(name, ".m3u8") {
 		ctx.Header("Content-Type", "application/vnd.apple.mpegurl")
