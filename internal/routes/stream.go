@@ -28,6 +28,7 @@ func (e *allRoutes) LoadHome(r *Route) {
 	defer log.Info("Loaded stream route")
 	r.Engine.GET("/stream/:messageID", getStreamRoute)
 	r.Engine.GET("/hls/:sessionID/*filename", getHLSFile)
+	r.Engine.Any("/hls-source/:sessionID", getHLSSource)
 }
 
 func getStreamRoute(ctx *gin.Context) {
@@ -56,10 +57,14 @@ func getStreamRoute(ctx *gin.Context) {
 				if err != nil || height <= 0 { http.Error(w, "invalid transcode height", http.StatusBadRequest); return }
 			}
 
-			// Use one HLS/FFmpeg session per Telegram file + requested height.
-			// PlayerJS may request the original /stream URL more than once.
-			key := fmt.Sprintf("%d:%d:%d", file.ID, file.FileSize, height)
-			sessionID, _, startErr := transcode.StartOrGet(key, worker.Client, file.Location, file.FileSize, height, log)
+			startSecond := 0.0
+			if rawStart := ctx.Query("start"); rawStart != "" {
+				startSecond, err = strconv.ParseFloat(rawStart, 64)
+				if err != nil || startSecond < 0 { http.Error(w, "invalid start parameter", http.StatusBadRequest); return }
+			}
+
+			key := fmt.Sprintf("%d:%d:%d:%.3f", file.ID, file.FileSize, height, startSecond)
+			sessionID, _, startErr := transcode.StartOrGet(key, worker.Client, file.Location, file.FileSize, height, startSecond, log)
 			if startErr != nil {
 				log.Error("Failed to start transcoder", zap.Error(startErr))
 				http.Error(w, "failed to start transcoder", http.StatusServiceUnavailable)
@@ -124,8 +129,6 @@ func getHLSFile(ctx *gin.Context) {
 	if !ok { http.Error(ctx.Writer, "stream session expired", http.StatusNotFound); return }
 
 	var path string
-	// FFmpeg may need time to probe the source and produce the first segment.
-	// Wait up to 45 seconds rather than returning a premature 404.
 	for i := 0; i < 450; i++ {
 		if candidate, exists := transcode.FilePath(session, name); exists { path = candidate; break }
 		if transcode.IsFinished(session) { break }
@@ -152,4 +155,8 @@ func getHLSFile(ctx *gin.Context) {
 	}
 	ctx.Header("Access-Control-Allow-Origin", "*")
 	http.ServeFile(ctx.Writer, ctx.Request, path)
+}
+
+func getHLSSource(ctx *gin.Context) {
+	transcode.ServeSource(ctx.Writer, ctx.Request, ctx.Param("sessionID"), log)
 }
