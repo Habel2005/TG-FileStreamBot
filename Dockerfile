@@ -8,13 +8,15 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /app/fsb -ld
 FROM alpine:3.21
 RUN apk add --no-cache ffmpeg ca-certificates tzdata
 RUN adduser -D -u 1000 hfuser \
-    && mkdir -p /app \
-    && chown -R hfuser:hfuser /app
+    && mkdir -p /app /tmp \
+    && chown -R hfuser:hfuser /app /tmp
 
 WORKDIR /app
 COPY --from=builder --chown=hfuser:hfuser /app/fsb /app/fsb
 
 USER 1000
 ENV PORT=7860
+ENV TRANSCODE_ENABLED=true
+ENV TRANSCODE_HEIGHT=480
 EXPOSE 7860
 ENTRYPOINT ["/app/fsb", "run"]
