@@ -1,14 +1,19 @@
 package routes
 
 import (
+	"EverythingSuckz/fsb/config"
 	"EverythingSuckz/fsb/internal/bot"
 	"EverythingSuckz/fsb/internal/stream"
+	"EverythingSuckz/fsb/internal/transcode"
 	"EverythingSuckz/fsb/internal/types"
 	"EverythingSuckz/fsb/internal/utils"
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/gotd/td/tg"
 	range_parser "github.com/quantumsheep/range-parser"
@@ -23,6 +28,7 @@ func (e *allRoutes) LoadHome(r *Route) {
 	log = e.log.Named("Stream")
 	defer log.Info("Loaded stream route")
 	r.Engine.GET("/stream/:messageID", getStreamRoute)
+	r.Engine.GET("/hls/:sessionID/*filename", getHLSFile)
 }
 
 func getStreamRoute(ctx *gin.Context) {
@@ -52,22 +58,37 @@ func getStreamRoute(ctx *gin.Context) {
 		return
 	}
 
-	expectedHash := utils.PackFile(
-		file.FileName,
-		file.FileSize,
-		file.MimeType,
-		file.ID,
-	)
+	expectedHash := utils.PackFile(file.FileName, file.FileSize, file.MimeType, file.ID)
 	if !utils.CheckHash(authHash, expectedHash) {
 		http.Error(w, "invalid hash", http.StatusBadRequest)
 		return
+	}
+
+	// Optional on-demand transcoding. Existing URLs are unchanged unless
+	// ?transcode=480 (or another requested height) is added.
+	if r.Method == http.MethodGet && strings.HasPrefix(strings.ToLower(file.MimeType), "video/") {
+		if requested := ctx.Query("transcode"); requested != "" && config.ValueOf.TranscodeEnabled {
+			height, parseErr := strconv.Atoi(requested)
+			if parseErr != nil || height <= 0 {
+				http.Error(w, "invalid transcode height", http.StatusBadRequest)
+				return
+			}
+			sessionID, _, startErr := transcode.Start(worker.Client, file.Location, file.FileSize, height, log)
+			if startErr != nil {
+				log.Error("Failed to start transcoder", zap.Error(startErr))
+				http.Error(w, "failed to start transcoder", http.StatusServiceUnavailable)
+				return
+			}
+			ctx.Redirect(http.StatusFound, "/hls/"+sessionID+"/index.m3u8")
+			return
+		}
 	}
 
 	// for photo messages
 	if file.FileSize == 0 {
 		res, err := worker.Client.API().UploadGetFile(ctx, &tg.UploadGetFileRequest{
 			Location: file.Location,
-			Offset:   0,
+			Offset: 0,
 			Limit:    1024 * 1024,
 		})
 		if err != nil {
@@ -110,7 +131,6 @@ func getStreamRoute(ctx *gin.Context) {
 
 	contentLength := end - start + 1
 	mimeType := file.MimeType
-
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
@@ -119,11 +139,9 @@ func getStreamRoute(ctx *gin.Context) {
 	ctx.Header("Content-Length", strconv.FormatInt(contentLength, 10))
 
 	disposition := "inline"
-
 	if ctx.Query("d") == "true" {
 		disposition = "attachment"
 	}
-
 	ctx.Header("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, file.FileName))
 
 	if r.Method != "HEAD" {
@@ -139,4 +157,47 @@ func getStreamRoute(ctx *gin.Context) {
 			}
 		}
 	}
+}
+
+func getHLSFile(ctx *gin.Context) {
+	sessionID := ctx.Param("sessionID")
+	name := filepath.Base(ctx.Param("filename"))
+	if name == "." || name == "" {
+		name = "index.m3u8"
+	}
+
+	session, ok := transcode.Touch(sessionID)
+	if !ok {
+		http.Error(ctx.Writer, "stream session expired", http.StatusNotFound)
+		return
+	}
+
+	// FFmpeg needs a moment to produce the first playlist/segment. Wait briefly
+	// rather than failing the player immediately on the first request.
+	var path string
+	for i := 0; i < 100; i++ {
+		if candidate, exists := transcode.FilePath(session, name); exists {
+			path = candidate
+			break
+		}
+		select {
+		case <-ctx.Request.Context().Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if path == "" {
+		http.Error(ctx.Writer, "stream segment not ready", http.StatusNotFound)
+		return
+	}
+
+	if strings.HasSuffix(name, ".m3u8") {
+		ctx.Header("Content-Type", "application/vnd.apple.mpegurl")
+		ctx.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+	} else {
+		ctx.Header("Content-Type", "video/mp2t")
+		ctx.Header("Cache-Control", "public, max-age=60")
+	}
+	ctx.Header("Access-Control-Allow-Origin", "*")
+	http.ServeFile(ctx.Writer, ctx.Request, path)
 }
