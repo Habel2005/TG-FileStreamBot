@@ -30,20 +30,58 @@ type Session struct {
 var sessions = struct {
 	sync.RWMutex
 	items map[string]*Session
-}{items: make(map[string]*Session)}
+	keys  map[string]string
+}{items: make(map[string]*Session), keys: make(map[string]string)}
 
 var cleanupOnce sync.Once
 
-func Start(client *gotgproto.Client, location tg.InputFileLocationClass, size int64, height int, log *zap.Logger) (string, *Session, error) {
+func StartOrGet(key string, client *gotgproto.Client, location tg.InputFileLocationClass, size int64, height int, log *zap.Logger) (string, *Session, error) {
+	// Reuse one FFmpeg process for repeated browser/player requests for the same video.
+	sessions.RLock()
+	if id, ok := sessions.keys[key]; ok {
+		if s := sessions.items[id]; s != nil {
+			s.mu.Lock()
+			finished := s.finished
+			s.lastAccess = time.Now()
+			s.mu.Unlock()
+			sessions.RUnlock()
+			if !finished {
+				return id, s, nil
+			}
+		}
+	}
+	sessions.RUnlock()
+
+	return startNew(key, client, location, size, height, log)
+}
+
+func startNew(key string, client *gotgproto.Client, location tg.InputFileLocationClass, size int64, height int, log *zap.Logger) (string, *Session, error) {
 	if size <= 0 { return "", nil, fmt.Errorf("invalid source size: %d", size) }
 	if height < 144 { height = 144 }
 	if height > 1080 { height = 1080 }
 
-	id, err := randomID(); if err != nil { return "", nil, err }
-	dir, err := os.MkdirTemp("", "fsb-hls-"); if err != nil { return "", nil, err }
+	// Serialize creation for a source key so simultaneous /stream requests cannot
+	// start multiple FFmpeg processes for the same video.
+	sessions.Lock()
+	if id, ok := sessions.keys[key]; ok {
+		if s := sessions.items[id]; s != nil {
+			s.mu.Lock()
+			finished := s.finished
+			s.lastAccess = time.Now()
+			s.mu.Unlock()
+			if !finished {
+				sessions.Unlock()
+				return id, s, nil
+			}
+		}
+	}
+	id, err := randomID()
+	if err != nil { sessions.Unlock(); return "", nil, err }
+	dir, err := os.MkdirTemp("", "fsb-hls-")
+	if err != nil { sessions.Unlock(); return "", nil, err }
 
 	pipe, err := stream.NewStreamPipe(contextBackground{}, client, location, 0, size-1, log)
-	if err != nil { _ = os.RemoveAll(dir); return "", nil, err }
+	if err != nil { sessions.Unlock(); _ = os.RemoveAll(dir); return "", nil, err }
 
 	playlist := filepath.Join(dir, "index.m3u8")
 	segments := filepath.Join(dir, "segment-%06d.ts")
@@ -62,22 +100,38 @@ func Start(client *gotgproto.Client, location tg.InputFileLocationClass, size in
 	cmd := exec.Command("ffmpeg", args...)
 	cmd.Stdin = pipe
 	s := &Session{Dir: dir, lastAccess: time.Now(), cmd: cmd}
-	sessions.Lock(); sessions.items[id] = s; sessions.Unlock()
+	sessions.items[id] = s
+	sessions.keys[key] = id
+	sessions.Unlock()
 
 	if err := cmd.Start(); err != nil {
-		_ = pipe.Close(); _ = os.RemoveAll(dir)
-		sessions.Lock(); delete(sessions.items, id); sessions.Unlock()
+		_ = pipe.Close()
+		_ = os.RemoveAll(dir)
+		sessions.Lock()
+		delete(sessions.items, id)
+		if sessions.keys[key] == id { delete(sessions.keys, key) }
+		sessions.Unlock()
 		return "", nil, fmt.Errorf("start ffmpeg: %w", err)
 	}
 
 	go func() {
-		err := cmd.Wait(); _ = pipe.Close()
-		s.mu.Lock(); s.finished = true; s.mu.Unlock()
+		err := cmd.Wait()
+		_ = pipe.Close()
+		s.mu.Lock()
+		s.finished = true
+		s.mu.Unlock()
 		if err != nil { log.Error("HLS transcoder exited", zap.String("session", id), zap.Error(err)) }
 	}()
 
 	cleanupOnce.Do(func() { go cleanupLoop() })
 	return id, s, nil
+}
+
+// Start is retained for compatibility with callers that don't need session reuse.
+func Start(client *gotgproto.Client, location tg.InputFileLocationClass, size int64, height int, log *zap.Logger) (string, *Session, error) {
+	key, err := randomID()
+	if err != nil { return "", nil, err }
+	return startNew(key, client, location, size, height, log)
 }
 
 type contextBackground struct{}
@@ -87,10 +141,21 @@ func (contextBackground) Err() error { return nil }
 func (contextBackground) Value(any) any { return nil }
 
 func Touch(id string) (*Session, bool) {
-	sessions.RLock(); s := sessions.items[id]; sessions.RUnlock()
+	sessions.RLock()
+	s := sessions.items[id]
+	sessions.RUnlock()
 	if s == nil { return nil, false }
-	s.mu.Lock(); s.lastAccess = time.Now(); s.mu.Unlock()
+	s.mu.Lock()
+	s.lastAccess = time.Now()
+	s.mu.Unlock()
 	return s, true
+}
+
+func IsFinished(s *Session) bool {
+	s.mu.Lock()
+	finished := s.finished
+	s.mu.Unlock()
+	return finished
 }
 
 func FilePath(s *Session, name string) (string, bool) {
@@ -102,7 +167,13 @@ func FilePath(s *Session, name string) (string, bool) {
 }
 
 func Remove(id string) {
-	sessions.Lock(); s := sessions.items[id]; delete(sessions.items, id); sessions.Unlock()
+	sessions.Lock()
+	s := sessions.items[id]
+	delete(sessions.items, id)
+	for key, sessionID := range sessions.keys {
+		if sessionID == id { delete(sessions.keys, key) }
+	}
+	sessions.Unlock()
 	if s != nil {
 		s.mu.Lock()
 		if s.cmd != nil && s.cmd.Process != nil && !s.finished { _ = s.cmd.Process.Kill() }
@@ -112,12 +183,16 @@ func Remove(id string) {
 }
 
 func cleanupLoop() {
-	ticker := time.NewTicker(30 * time.Second); defer ticker.Stop()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
 	for range ticker.C {
-		now := time.Now(); var expired []string
+		now := time.Now()
+		var expired []string
 		sessions.RLock()
 		for id, s := range sessions.items {
-			s.mu.Lock(); last := s.lastAccess; s.mu.Unlock()
+			s.mu.Lock()
+			last := s.lastAccess
+			s.mu.Unlock()
 			if now.Sub(last) > sessionTTL { expired = append(expired, id) }
 		}
 		sessions.RUnlock()
@@ -126,6 +201,7 @@ func cleanupLoop() {
 }
 
 func randomID() (string, error) {
-	b := make([]byte, 18); if _, err := rand.Read(b); err != nil { return "", err }
+	b := make([]byte, 18)
+	if _, err := rand.Read(b); err != nil { return "", err }
 	return hex.EncodeToString(b), nil
 }
