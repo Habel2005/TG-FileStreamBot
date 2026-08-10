@@ -48,13 +48,11 @@ type config struct {
 	AllowedUsers   allowedUsers `envconfig:"ALLOWED_USERS"`
 	MultiTokens    []string
 
-	// stream specific config
 	StreamConcurrency int `envconfig:"STREAM_CONCURRENCY" default:"4"`
 	StreamBufferCount int `envconfig:"STREAM_BUFFER_COUNT" default:"8"`
 	StreamTimeoutSec  int `envconfig:"STREAM_TIMEOUT_SEC" default:"30"`
 	StreamMaxRetries  int `envconfig:"STREAM_MAX_RETRIES" default:"3"`
 
-	// optional on-demand video transcoding
 	TranscodeEnabled bool `envconfig:"TRANSCODE_ENABLED" default:"false"`
 	TranscodeHeight  int  `envconfig:"TRANSCODE_HEIGHT" default:"480"`
 }
@@ -113,8 +111,14 @@ func (c *config) loadConfigFromArgs(log *zap.Logger, cmd *cobra.Command) {
 	streamBufferCount, _ := cmd.Flags().GetInt("stream-buffer-count"); if streamBufferCount != 0 { os.Setenv("STREAM_BUFFER_COUNT", strconv.Itoa(streamBufferCount)) }
 	streamTimeoutSec, _ := cmd.Flags().GetInt("stream-timeout-sec"); if streamTimeoutSec != 0 { os.Setenv("STREAM_TIMEOUT_SEC", strconv.Itoa(streamTimeoutSec)) }
 	streamMaxRetries, _ := cmd.Flags().GetInt("stream-max-retries"); if streamMaxRetries != 0 { os.Setenv("STREAM_MAX_RETRIES", strconv.Itoa(streamMaxRetries)) }
-	transcodeEnabled, _ := cmd.Flags().GetBool("transcode-enabled"); os.Setenv("TRANSCODE_ENABLED", strconv.FormatBool(transcodeEnabled))
-	transcodeHeight, _ := cmd.Flags().GetInt("transcode-height"); if transcodeHeight != 0 { os.Setenv("TRANSCODE_HEIGHT", strconv.Itoa(transcodeHeight)) }
+	if cmd.Flags().Changed("transcode-enabled") {
+		transcodeEnabled, _ := cmd.Flags().GetBool("transcode-enabled")
+		os.Setenv("TRANSCODE_ENABLED", strconv.FormatBool(transcodeEnabled))
+	}
+	if cmd.Flags().Changed("transcode-height") {
+		transcodeHeight, _ := cmd.Flags().GetInt("transcode-height")
+		os.Setenv("TRANSCODE_HEIGHT", strconv.Itoa(transcodeHeight))
+	}
 }
 
 func (c *config) setupEnvVars(log *zap.Logger, cmd *cobra.Command) {
