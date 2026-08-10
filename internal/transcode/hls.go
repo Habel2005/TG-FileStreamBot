@@ -5,9 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,14 +20,21 @@ import (
 	"go.uber.org/zap"
 )
 
-const sessionTTL = 30 * time.Minute
+const (
+	sessionTTL     = 30 * time.Minute
+	sessionIdleTTL = 15 * time.Second
+)
 
 type Session struct {
-	Dir        string
-	mu         sync.Mutex
-	lastAccess time.Time
-	cmd        *exec.Cmd
-	finished   bool
+	Dir         string
+	mu          sync.Mutex
+	lastAccess  time.Time
+	cmd         *exec.Cmd
+	finished    bool
+	client      *gotgproto.Client
+	location    tg.InputFileLocationClass
+	size        int64
+	startSecond float64
 }
 
 var sessions = struct {
@@ -35,7 +45,7 @@ var sessions = struct {
 
 var cleanupOnce sync.Once
 
-func StartOrGet(key string, client *gotgproto.Client, location tg.InputFileLocationClass, size int64, height int, log *zap.Logger) (string, *Session, error) {
+func StartOrGet(key string, client *gotgproto.Client, location tg.InputFileLocationClass, size int64, height int, startSecond float64, log *zap.Logger) (string, *Session, error) {
 	sessions.RLock()
 	if id, ok := sessions.keys[key]; ok {
 		if s := sessions.items[id]; s != nil {
@@ -50,10 +60,10 @@ func StartOrGet(key string, client *gotgproto.Client, location tg.InputFileLocat
 		}
 	}
 	sessions.RUnlock()
-	return startNew(key, client, location, size, height, log)
+	return startNew(key, client, location, size, height, startSecond, log)
 }
 
-func startNew(key string, client *gotgproto.Client, location tg.InputFileLocationClass, size int64, height int, log *zap.Logger) (string, *Session, error) {
+func startNew(key string, client *gotgproto.Client, location tg.InputFileLocationClass, size int64, height int, startSecond float64, log *zap.Logger) (string, *Session, error) {
 	if size <= 0 {
 		return "", nil, fmt.Errorf("invalid source size: %d", size)
 	}
@@ -62,6 +72,9 @@ func startNew(key string, client *gotgproto.Client, location tg.InputFileLocatio
 	}
 	if height > 1080 {
 		height = 1080
+	}
+	if startSecond < 0 {
+		startSecond = 0
 	}
 
 	sessions.Lock()
@@ -89,18 +102,19 @@ func startNew(key string, client *gotgproto.Client, location tg.InputFileLocatio
 		return "", nil, err
 	}
 
-	pipe, err := stream.NewStreamPipe(contextBackground{}, client, location, 0, size-1, log)
-	if err != nil {
-		sessions.Unlock()
-		_ = os.RemoveAll(dir)
-		return "", nil, err
-	}
-
 	playlist := filepath.Join(dir, "index.m3u8")
 	segments := filepath.Join(dir, "segment-%06d.ts")
+	sourceURL := fmt.Sprintf("http://127.0.0.1:7860/hls-source/%s", id)
+
 	args := []string{
 		"-hide_banner", "-loglevel", "warning",
-		"-i", "pipe:0",
+	}
+	if startSecond > 0 {
+		args = append(args, "-ss", strconv.FormatFloat(startSecond, 'f', 3, 64))
+	}
+	args = append(args,
+		"-seekable", "1",
+		"-i", sourceURL,
 		"-map", "0:v:0?", "-map", "0:a:0?",
 		"-vf", fmt.Sprintf("scale=-2:%d", height),
 		"-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p",
@@ -110,19 +124,25 @@ func startNew(key string, client *gotgproto.Client, location tg.InputFileLocatio
 		"-f", "hls", "-hls_time", "6", "-hls_list_size", "8",
 		"-hls_flags", "delete_segments+independent_segments",
 		"-hls_segment_filename", segments, playlist,
-	}
+	)
 
 	cmd := exec.Command("ffmpeg", args...)
-	cmd.Stdin = pipe
 	cmd.Stderr = logWriter{log: log, sessionID: id}
 
-	s := &Session{Dir: dir, lastAccess: time.Now(), cmd: cmd}
+	s := &Session{
+		Dir:         dir,
+		lastAccess:  time.Now(),
+		cmd:         cmd,
+		client:      client,
+		location:    location,
+		size:        size,
+		startSecond: startSecond,
+	}
 	sessions.items[id] = s
 	sessions.keys[key] = id
 	sessions.Unlock()
 
 	if err := cmd.Start(); err != nil {
-		_ = pipe.Close()
 		_ = os.RemoveAll(dir)
 		sessions.Lock()
 		delete(sessions.items, id)
@@ -135,7 +155,6 @@ func startNew(key string, client *gotgproto.Client, location tg.InputFileLocatio
 
 	go func() {
 		err := cmd.Wait()
-		_ = pipe.Close()
 		s.mu.Lock()
 		s.finished = true
 		s.mu.Unlock()
@@ -155,7 +174,7 @@ func Start(client *gotgproto.Client, location tg.InputFileLocationClass, size in
 	if err != nil {
 		return "", nil, err
 	}
-	return startNew(key, client, location, size, height, log)
+	return startNew(key, client, location, size, height, 0, log)
 }
 
 type contextBackground struct{}
@@ -210,6 +229,85 @@ func FilePath(s *Session, name string) (string, bool) {
 	return path, true
 }
 
+// ServeSource exposes the original Telegram file as a seekable HTTP resource
+// for FFmpeg. FFmpeg can then use HTTP Range requests when starting at a seek point.
+func ServeSource(w http.ResponseWriter, r *http.Request, id string, log *zap.Logger) {
+	sessions.RLock()
+	s := sessions.items[id]
+	sessions.RUnlock()
+	if s == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	s.mu.Lock()
+	client := s.client
+	location := s.location
+	size := s.size
+	s.mu.Unlock()
+	if client == nil || size <= 0 {
+		http.Error(w, "invalid source session", http.StatusServiceUnavailable)
+		return
+	}
+
+	rangeHeader := r.Header.Get("Range")
+	var start, end int64
+	if rangeHeader == "" {
+		start, end = 0, size-1
+	} else {
+		if !strings.HasPrefix(rangeHeader, "bytes=") {
+			http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		parts := strings.Split(strings.TrimPrefix(rangeHeader, "bytes="), "-")
+		if len(parts) != 2 {
+			http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		var err error
+		start, err = strconv.ParseInt(parts[0], 10, 64)
+		if err != nil || start < 0 || start >= size {
+			http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		end = size - 1
+		if parts[1] != "" {
+			end, err = strconv.ParseInt(parts[1], 10, 64)
+			if err != nil || end < start {
+				http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			if end >= size {
+				end = size - 1
+			}
+		}
+	}
+
+	length := end - start + 1
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+	w.Header().Set("Content-Type", "video/mp4")
+	if rangeHeader != "" {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+	if r.Method == http.MethodHead {
+		return
+	}
+
+	pipe, err := stream.NewStreamPipe(contextBackground{}, client, location, start, end, log)
+	if err != nil {
+		http.Error(w, "telegram source unavailable", http.StatusBadGateway)
+		return
+	}
+	defer pipe.Close()
+	if _, err := io.CopyN(w, pipe, length); err != nil {
+		log.Debug("FFmpeg source request ended", zap.String("session", id), zap.Error(err))
+	}
+}
+
 func Remove(id string) {
 	sessions.Lock()
 	s := sessions.items[id]
@@ -231,7 +329,7 @@ func Remove(id string) {
 }
 
 func cleanupLoop() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
 		now := time.Now()
@@ -241,7 +339,7 @@ func cleanupLoop() {
 			s.mu.Lock()
 			last := s.lastAccess
 			s.mu.Unlock()
-			if now.Sub(last) > sessionTTL {
+			if now.Sub(last) > sessionIdleTTL || now.Sub(last) > sessionTTL {
 				expired = append(expired, id)
 			}
 		}
@@ -254,7 +352,8 @@ func cleanupLoop() {
 
 func randomID() (string, error) {
 	b := make([]byte, 18)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := rand.Read(b)
+	; err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
