@@ -48,12 +48,14 @@ func Start(client *gotgproto.Client, location tg.InputFileLocationClass, size in
 	playlist := filepath.Join(dir, "index.m3u8")
 	segments := filepath.Join(dir, "segment-%06d.ts")
 	args := []string{
-		"-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+		"-hide_banner", "-loglevel", "error",
+		"-re", "-i", "pipe:0",
 		"-map", "0:v:0?", "-map", "0:a:0?",
 		"-vf", fmt.Sprintf("scale=-2:%d", height),
 		"-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p",
 		"-c:a", "aac", "-b:a", "96k",
-		"-f", "hls", "-hls_time", "6", "-hls_list_size", "0",
+		"-f", "hls", "-hls_time", "6", "-hls_list_size", "8",
+		"-hls_flags", "delete_segments",
 		"-hls_segment_filename", segments, playlist,
 	}
 
